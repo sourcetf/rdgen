@@ -1,4 +1,5 @@
 import io
+import logging
 from pathlib import Path
 from django.http import HttpResponse, JsonResponse, HttpResponseForbidden
 from django.shortcuts import render, get_object_or_404
@@ -18,6 +19,8 @@ from .models import GithubRun
 from PIL import Image
 from urllib.parse import quote
 
+logger = logging.getLogger(__name__)
+
 
 def generate_custom_client(params, full_url):
     """
@@ -35,10 +38,11 @@ def generate_custom_client(params, full_url):
     selfhosted = (_settings.SH_SECRET == user_secret)
     platform = params.get('platform', 'windows')
     version = params.get('version', '1.4.9')
-    delayFix = params.get('delayFix', True)
-    xOffline = params.get('xOffline', False)
     hidecm = params.get('hidecm', False)
-    removeNewVersionNotif = params.get('removeNewVersionNotif', False)
+    # Toggles in the web form that gate CI-side sed/patch steps
+    delayFix = bool(params.get('delayFix', True))
+    xOffline = bool(params.get('xOffline', False))
+    removeNewVersionNotif = bool(params.get('removeNewVersionNotif', False))
     server = params.get('serverIP', '')
     key = params.get('key', '')
     apiServer = params.get('apiServer', '')
@@ -134,6 +138,23 @@ def generate_custom_client(params, full_url):
         privacylink_file = "false"
 
     ###create the custom.txt json here and send in as inputs below
+    # icons/logos are fetched by the CI from this server; without a publicly
+    # reachable GENURL the runners cannot download them, so disable them
+    # instead of failing the build.
+    if not _settings.GENURL:
+        print("WARNING: GENURL not configured; custom icon/logo/privacy images are disabled")
+        iconlink_url = "false"; iconlink_uuid = "false"; iconlink_file = "false"
+        logolink_url = "false"; logolink_uuid = "false"; logolink_file = "false"
+        privacylink_url = "false"; privacylink_uuid = "false"; privacylink_file = "false"
+    else:
+        # serve images through the public URL so runners can reach them
+        if iconlink_url != "false":
+            iconlink_url = _settings.GENURL
+        if logolink_url != "false":
+            logolink_url = _settings.GENURL
+        if privacylink_url != "false":
+            privacylink_url = _settings.GENURL
+
     decodedCustom = {}
     if direction != "Both":
         decodedCustom['conn-type'] = direction
@@ -204,9 +225,13 @@ def generate_custom_client(params, full_url):
         decodedCustom['override-settings']['enable-remote-printer'] = 'Y' if enablePrinter else 'N'
         decodedCustom['override-settings']['enable-camera'] = 'Y' if enableCamera else 'N'
         decodedCustom['override-settings']['enable-terminal'] = 'Y' if enableTerminal else 'N'
-        if direction == 'incoming':
-            decodedCustom['override-settings']['custom-rendezvous-server'] = server
-            decodedCustom['override-settings']['api-server'] = apiServer
+        # Always include server/api in override-settings so the Flutter
+        # client (which reads customClientConfig at runtime) sees the same
+        # rendezvous/api as the native code. Previously these were only
+        # written when direction == 'incoming', which made outgoing/both
+        # builds lose their server settings after the first launch.
+        decodedCustom['override-settings']['custom-rendezvous-server'] = server
+        decodedCustom['override-settings']['api-server'] = apiServer
 
     if defaultManual:
         for line in defaultManual.splitlines():
@@ -259,17 +284,22 @@ def generate_custom_client(params, full_url):
         "privacylink_url":privacylink_url,
         "privacylink_uuid":privacylink_uuid,
         "privacylink_file":privacylink_file,
+        # also pass raw base64 so the CI can embed the image without
+        # needing to reach this server (which won't be publicly reachable
+        # in most deployments)
+        "iconbase64": (params.get('iconbase64','') or params.get('iconfile','') or ''),
+        "logobase64": (params.get('logobase64','') or params.get('logofile','') or ''),
+        "privacybase64": (params.get('privacybase64','') or params.get('privacyfile','') or ''),
         "appname":appname,
-        "genurl":_settings.GENURL,
         "urlLink":urlLink,
         "downloadLink":downloadLink,
-        "delayFix": 'true' if delayFix else 'false',
         "rdgen":'true',
-        "xOffline": 'true' if xOffline else 'false',
-        "removeNewVersionNotif": 'true' if removeNewVersionNotif else 'false',
         "compname": compname,
         "androidappid":androidappid,
-        "filename":filename
+        "filename":filename,
+        "delayFix": 'true' if delayFix else 'false',
+        "xOffline": 'true' if xOffline else 'false',
+        "removeNewVersionNotif": 'true' if removeNewVersionNotif else 'false',
     }
 
     temp_json_path = f"data_{uuid.uuid4()}.json"
@@ -297,7 +327,10 @@ def generate_custom_client(params, full_url):
         "ref":_settings.GHBRANCH,
         "inputs":{
             "version":version,
-            "zip_url":zip_url
+            "zip_url":zip_url,
+            # pass the full config inline so the runners do not need to reach
+            # this server to download the secrets zip
+            "config_b64": base64.b64encode(json.dumps(inputs_raw).encode("ascii")).decode("ascii"),
         },
         "return_run_details": True
     } 
@@ -314,7 +347,7 @@ def generate_custom_client(params, full_url):
     try:
         response = requests.post(url, json=data, headers=headers)
         if response.status_code == 204 or response.status_code == 200:
-            github_data = response.json()
+            github_data = response.json() if response.content else {}
             print(github_data)
             new_github_run.github_run_id = github_data.get('workflow_run_id')
             new_github_run.status = "in_progress"
@@ -328,12 +361,21 @@ def generate_custom_client(params, full_url):
                 "log_url": github_data.get('html_url')
             }
         else:
+            logger.error("GitHub workflow dispatch rejected: POST %s -> HTTP %s: %s",
+                         url, response.status_code, response.text[:1000])
+            gh_message = ""
+            try:
+                gh_message = response.json().get("message", "")
+            except ValueError:
+                gh_message = response.text[:300]
             return {
                 "success": False,
-                "error": "GitHub rejected the start request",
-                "status_code": 500
+                "error": "GitHub rejected the start request (HTTP %s): %s" % (
+                    response.status_code, gh_message or "no response body"),
+                "status_code": response.status_code
             }
     except Exception as e:
+        logger.exception("GitHub workflow dispatch request to %s failed", url)
         return {
             "success": False,
             "error": f"Connection error: {str(e)}",
