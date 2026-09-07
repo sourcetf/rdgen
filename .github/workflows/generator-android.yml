@@ -13,7 +13,16 @@ on:
         required: true
         default: ''
         type: string
+      config_b64:
+        description: 'base64-encoded config JSON (overrides zip_url)'
+        required: false
+        default: ''
+        type: string
 
+
+permissions:
+  contents: write
+  actions: write
 
 env:
   SCITER_RUST_VERSION: "1.75" # https://github.com/rustdesk/rustdesk/discussions/7503, also 1.78 has ABI change which causes our sciter version not working, https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
@@ -29,7 +38,7 @@ env:
   TAG_NAME: "${{ inputs.upload-tag }}"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   # vcpkg version: 2024.07.12
-  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_COMMIT_ID: "${{ inputs.version == 'master' && '9e593bb18ea69cc5095e012465dcd675a822ed0d' || '120deac3062162151622ca4860575a33844ba10b' }}"
   ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836"
   VERSION: "${{ inputs.version }}"
   NDK_VERSION: "r28c"
@@ -45,6 +54,8 @@ jobs:
     uses: ./.github/workflows/fetch-encrypted-secrets.yml
     with:
       zip_url_json: ${{ inputs.zip_url }}
+      config_b64: ${{ inputs.config_b64 }}
+    secrets: inherit
 
   generate-bridge-linux:
     uses: ./.github/workflows/bridge.yml
@@ -85,6 +96,7 @@ jobs:
         uses: actions/checkout@v4
         
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: encrypted-secrets-zip
 
@@ -92,6 +104,27 @@ jobs:
         uses: ./.github/actions/decrypt-secrets
         with:
           zip_password: ${{ secrets.ZIP_PASSWORD }}
+
+        continue-on-error: true
+      - name: Default config when no custom zip
+        if: ${{ env.filename == '' }}
+        shell: bash
+        run: |
+          echo "WARNING: no custom client config loaded; building with default settings"
+          {
+            echo "filename=rustdesk"
+            echo "appname=rustdesk"
+            echo "compname=Purslane Ltd"
+            echo "urlLink=https://rustdesk.com"
+            echo "downloadLink=https://rustdesk.com/download"
+            echo "iconlink_url=false"
+            echo "logolink_url=false"
+            echo "androidappid=com.carriez.flutter_hbb"
+            echo "delayFix=false"
+            echo "xOffline=false"
+            echo "removeNewVersionNotif=false"
+            echo "hidecm=false"
+          } >> "$GITHUB_ENV"
 
       - name: Finalize and Cleanup zip/json
         if: always() # Run even if previous steps fail
@@ -215,32 +248,39 @@ jobs:
           doNotCache: false
 
       - name: Install vcpkg dependencies
-        run: |
-          case ${{ matrix.job.target }} in
-            aarch64-linux-android)
-              ANDROID_TARGET=arm64-v8a
-            ;;
-            armv7-linux-androideabi)
-              ANDROID_TARGET=armeabi-v7a
-            ;;
-            x86_64-linux-android)
-              ANDROID_TARGET=x86_64
-            ;;
-            i686-linux-android)
-              ANDROID_TARGET=x86
-            ;;
-          esac
-          if ! ./flutter/build_android_deps.sh "${ANDROID_TARGET}"; then
-            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
-              echo "$_1:"
-              echo "======"
-              cat "$_1"
-              echo "======"
-              echo ""
-            done
-            exit 1
-          fi
-        shell: bash
+        # vcpkg fails hard when the GitHub Actions cache service (x-gha binary
+        # cache) hiccups; build_android_deps.sh is idempotent, so retry it.
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 120
+          max_attempts: 3
+          retry_wait_seconds: 30
+          shell: bash
+          command: |
+            case ${{ matrix.job.target }} in
+              aarch64-linux-android)
+                ANDROID_TARGET=arm64-v8a
+              ;;
+              armv7-linux-androideabi)
+                ANDROID_TARGET=armeabi-v7a
+              ;;
+              x86_64-linux-android)
+                ANDROID_TARGET=x86_64
+              ;;
+              i686-linux-android)
+                ANDROID_TARGET=x86
+              ;;
+            esac
+            if ! ./flutter/build_android_deps.sh "${ANDROID_TARGET}"; then
+              find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+                echo "$_1:"
+                echo "======"
+                cat "$_1"
+                echo "======"
+                echo ""
+              done
+              exit 1
+            fi
 
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -259,9 +299,18 @@ jobs:
           prefix-key: rustdesk-lib-cache-android # TODO: drop '-android' part after caches are invalidated
           key: ${{ matrix.job.target }}
 
-      ###########################################################echo "${{ env.iconbase64 }}" | base64 -d > ./res/icon.png
+      # Prefer inline base64 icons when supplied (avoids needing public GENURL);
+      # fall through to the iconlink_url path otherwise.
+      - name: Use inline iconbase64
+        if: ${{ env.iconbase64 != '' }}
+        shell: bash
+        run: |
+          echo "${{ env.iconbase64 }}" | base64 -d > ./res/icon.png
+          [ -s ./res/icon.png ] || { echo "iconbase64 decoded to empty file"; exit 1; }
+          echo "icon.png written from env.iconbase64"
+
       - name: icon stuff
-        if: ${{ env.iconlink_url != 'false' }}
+        if: ${{ env.iconlink_url != 'false' && env.iconbase64 == '' }}
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 5
@@ -272,7 +321,7 @@ jobs:
             mv ./res/icon.ico ./res/icon.ico.bak
             mv ./res/icon.png ./res/icon.png.bak
             mv ./res/tray-icon.ico ./res/tray-icon.ico.bak
-            wget -T 30 -t 2 -O ./res/icon.png ${{ env.iconlink_url }}/get_png?filename=${{ env.iconlink_file }}"&"uuid=${{ env.iconlink_uuid }}
+            wget -T 30 -t 2 -O ./res/icon.png "${{ env.iconlink_url }}/get_png?filename=${{ env.iconlink_file }}&uuid=${{ env.iconlink_uuid }}" || { echo "icon download failed; default icon will be used"; exit 0; }
             mv ./res/32x32.png ./res/32x32.png.bak
             mv ./res/64x64.png ./res/64x64.png.bak
             mv ./res/128x128.png ./res/128x128.png.bak
@@ -294,18 +343,39 @@ jobs:
             sed -i '/ic_launcher_background/d' ./flutter/android/app/src/main/res/values/colors.xml
 
       - name: set server, key, and apiserver
-        continue-on-error: true
+        if: env.server != ''
         shell: bash
         run: |
-          sed -i -e 's|rs-ny.rustdesk.com|${{ env.server }}|' ./libs/hbb_common/src/config.rs
-          sed -i -e 's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|${{ env.key }}|' ./libs/hbb_common/src/config.rs
-          sed -i -e 's|https://admin.rustdesk.com|${{ env.apiServer }}|' ./src/common.rs
-          # ./flutter/pubspec.yaml
-          #sed -i '/intl:/a \ \ archive: ^3.6.1' ./flutter/pubspec.yaml
+          # Save the new values to temp files (file content is not GitHub-masked)
+          printf '%s' "${{ env.server }}" > /tmp/_new_server
+          printf '%s' "${{ env.key }}"    > /tmp/_new_key
+          printf '%s' "${{ env.apiServer }}" > /tmp/_new_api
+          # Apply sed substitutions
+          sed -i -e 's|rs-ny.rustdesk.com|'"$(cat /tmp/_new_server)"'|' ./libs/hbb_common/src/config.rs
+          sed -i -e 's|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|'"$(cat /tmp/_new_key)"'|' ./libs/hbb_common/src/config.rs
+          sed -i -e 's|https://admin.rustdesk.com|'"$(cat /tmp/_new_api)"'|' ./src/common.rs
+          # Verify by reading the new values from temp files (no mask) and grepping
+          # the on-disk file content. This catches: (a) sed failed to find pattern,
+          # (b) bad quoting, etc. The temp file is the source of truth for the value
+          # we expect to find.
+          NEW_SRV=$(cat /tmp/_new_server)
+          NEW_KEY=$(cat /tmp/_new_key)
+          NEW_API=$(cat /tmp/_new_api)
+          if ! grep -qF "$NEW_SRV" ./libs/hbb_common/src/config.rs; then
+            echo "ERROR: server value not present in config.rs after sed"; exit 1
+          fi
+          if [ -n "$NEW_KEY" ] && ! grep -qF "$NEW_KEY" ./libs/hbb_common/src/config.rs; then
+            echo "ERROR: key value not present in config.rs after sed"; exit 1
+          fi
+          if [ -n "$NEW_API" ] && ! grep -qF "$NEW_API" ./src/common.rs; then
+            echo "ERROR: apiServer value not present in common.rs after sed"; exit 1
+          fi
+          # Cleanup
+          rm -f /tmp/_new_server /tmp/_new_key /tmp/_new_api
+          echo "server/key/apiServer patched OK"
           
       - name: change appname to custom
         if: env.appname != 'rustdesk'
-        continue-on-error: true
         shell: bash
         run: |
           sed -i -e 's|description = "RustDesk Remote Desktop"|description = "${{ env.appname }}"|' ./Cargo.toml
@@ -342,7 +412,6 @@ jobs:
 
       - name: change url to custom
         if: env.urlLink != 'https://rustdesk.com'
-        continue-on-error: true
         shell: bash
         run: |  
           sed -i -e 's|Homepage: https://rustdesk.com|Homepage: ${{ env.urlLink }}|' ./build.py
@@ -363,22 +432,33 @@ jobs:
         run: |
           KOTLIN=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
           DART=./flutter/lib/models/native_model.dart
-          sed -i "s|FFI.startServer(configPath, \"\")|FFI.startServer(configPath, \"${{ env.custom }}\")|" "$KOTLIN"
-          sed -i "s|customClientConfig: '',|customClientConfig: '${{ env.custom }}',|" "$DART"
+          # rustdesk >= 1.5 passes homePath to FFI.startServer; older tags have two args
+          sed -i "s|FFI.startServer(configPath, homePath, \"\")|FFI.startServer(configPath, homePath, \"${{ env.custom }}\")|" "$KOTLIN" || true
+          sed -i "s|FFI.startServer(configPath, \"\")|FFI.startServer(configPath, \"${{ env.custom }}\")|" "$KOTLIN" || true
+          sed -i "s|customClientConfig: '',|customClientConfig: '${{ env.custom }}',|" "$DART" || true
           echo "--- verify ---"
           grep -n 'FFI.startServer(configPath' "$KOTLIN" | sed 's/\(.\{80\}\).*/\1.../'
           grep -n 'customClientConfig:' "$DART" | sed 's/\(.\{80\}\).*/\1.../'
+          # Verify custom config length is non-trivial (proves base64 was embedded)
+          CUSTOM_LEN=$(grep -o "customClientConfig: '[^']*'" "$DART" | grep -o "'[^']*'" | tr -d "'" | wc -c)
+          if [ "$CUSTOM_LEN" -gt 10 ]; then
+            echo "custom config embedded, b64 length: $CUSTOM_LEN"
+            echo "custom config embedded OK"
+          else
+            if [ -n "${{ env.custom }}" ]; then
+              echo "ERROR: custom config not embedded into native_model.dart (length=$CUSTOM_LEN)"
+              exit 1
+            fi
+          fi
 
       - name: change app id to custom
         if: env.androidappid != 'com.carriez.flutter_hbb'
-        continue-on-error: true
         shell: bash
         run: |
           sed -i -e 's|com.carriez.flutter_hbb|${{ env.androidappid }}|' ./flutter/android/app/build.gradle
 
       - name: change download link to custom
         if: env.downloadLink != 'https://rustdesk.com/download'
-        continue-on-error: true
         shell: bash
         run: |
           sed -i -e 's|https://rustdesk.com/download|${{ env.downloadLink }}|' ./flutter/lib/desktop/pages/desktop_home_page.dart
@@ -440,12 +520,18 @@ jobs:
 
       - name: replace flutter icons
         if: ${{ env.iconlink_url != 'false' }}
-        run: |
-          pushd ./flutter
-          flutter pub get
-          dart run flutter_launcher_icons
-          popd
-          sed -i '/ic_launcher_background/d' ./flutter/android/app/src/main/res/values/colors.xml
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 15
+          shell: bash
+          command: |
+            pushd ./flutter
+            flutter pub get
+            dart run flutter_launcher_icons
+            popd
+            sed -i '/ic_launcher_background/d' ./flutter/android/app/src/main/res/values/colors.xml
       ##########################################################
 
       - name: Build rustdesk lib
@@ -569,28 +655,26 @@ jobs:
           # override default build-tools version (29.0.3) -- optional
           BUILD_TOOLS_VERSION: "30.0.2"
 
-      - name: send file to rdgen server
-        if: ${{ env.rdgen == 'true' }}
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 5
-          max_attempts: 3
-          retry_wait_seconds: 15
-          shell: bash
-          command: |
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./signed-apk/${{ env.filename }}-${{ matrix.job.arch }}.apk" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
-
-      - name: send file to api server
-        if: ${{ env.rdgen == 'false' }}
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 5
-          max_attempts: 3
-          retry_wait_seconds: 15
-          shell: bash
-          command: |
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./signed-apk/${{ env.filename }}-${{ matrix.job.arch }}.apk" ${{ env.apiServer }}/api/save_custom_client
-
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: client-${{ env.VERSION }}-${{ github.run_number }}
+        run: |
+          FILES=$(ls ./output/*.deb ./output/*.rpm ./output/*.pkg.tar.zst ./output/*.AppImage ./output/*.flatpak ./output/*.dmg ./signed-apk/*.apk ./SignOutput/*.exe ./SignOutput/*.msi "$GITHUB_WORKSPACE"/*.dmg 2>/dev/null || true)
+          if [ -z "$FILES" ]; then
+            echo "No build artifacts found to publish"
+            exit 1
+          fi
+          # the workspace .git may be the rustdesk checkout; always target this repo
+          REPO="$GITHUB_REPOSITORY"
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 ||             gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes "Automated client build from run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ok=0
+          for i in 1 2 3 4 5; do
+            if gh release upload "$TAG" $FILES --repo "$REPO" --clobber; then ok=1; break; fi
+            echo "release upload retry $i"
+            sleep 15
+          done
+          [ "$ok" = "1" ] || { echo "Failed to upload release assets"; exit 1; }
   deploy:
     needs: [build-rustdesk-android]
     runs-on: ubuntu-latest
@@ -599,6 +683,7 @@ jobs:
         uses: actions/checkout@v4
         
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: encrypted-secrets-zip
 
@@ -606,6 +691,27 @@ jobs:
         uses: ./.github/actions/decrypt-secrets
         with:
           zip_password: ${{ secrets.ZIP_PASSWORD }}
+
+        continue-on-error: true
+      - name: Default config when no custom zip
+        if: ${{ env.filename == '' }}
+        shell: bash
+        run: |
+          echo "WARNING: no custom client config loaded; building with default settings"
+          {
+            echo "filename=rustdesk"
+            echo "appname=rustdesk"
+            echo "compname=Purslane Ltd"
+            echo "urlLink=https://rustdesk.com"
+            echo "downloadLink=https://rustdesk.com/download"
+            echo "iconlink_url=false"
+            echo "logolink_url=false"
+            echo "androidappid=com.carriez.flutter_hbb"
+            echo "delayFix=false"
+            echo "xOffline=false"
+            echo "removeNewVersionNotif=false"
+            echo "hidecm=false"
+          } >> "$GITHUB_ENV"
 
       - name: Finalize and Cleanup zip/json
         if: always() # Run even if previous steps fail
@@ -642,3 +748,5 @@ jobs:
         uses: geekyeggo/delete-artifact@v5
         with:
           name: encrypted-secrets-zip
+
+# registered for workflow_dispatch
